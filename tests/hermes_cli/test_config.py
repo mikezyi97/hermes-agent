@@ -370,20 +370,40 @@ class TestOptionalEnvVarsRegistry:
         from hermes_cli.config import OPTIONAL_ENV_VARS
         assert "TAVILY_API_KEY" in OPTIONAL_ENV_VARS
 
+    def test_searxng_base_url_registered(self):
+        """SEARXNG_BASE_URL is listed in OPTIONAL_ENV_VARS."""
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        assert "SEARXNG_BASE_URL" in OPTIONAL_ENV_VARS
+
     def test_tavily_api_key_is_tool_category(self):
         """TAVILY_API_KEY is in the 'tool' category."""
         from hermes_cli.config import OPTIONAL_ENV_VARS
         assert OPTIONAL_ENV_VARS["TAVILY_API_KEY"]["category"] == "tool"
+
+    def test_searxng_base_url_is_tool_category(self):
+        """SEARXNG_BASE_URL is in the 'tool' category."""
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        assert OPTIONAL_ENV_VARS["SEARXNG_BASE_URL"]["category"] == "tool"
 
     def test_tavily_api_key_is_password(self):
         """TAVILY_API_KEY is marked as password."""
         from hermes_cli.config import OPTIONAL_ENV_VARS
         assert OPTIONAL_ENV_VARS["TAVILY_API_KEY"]["password"] is True
 
+    def test_searxng_base_url_is_not_password(self):
+        """SEARXNG_BASE_URL is not secret."""
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        assert OPTIONAL_ENV_VARS["SEARXNG_BASE_URL"]["password"] is False
+
     def test_tavily_api_key_has_url(self):
         """TAVILY_API_KEY has a URL."""
         from hermes_cli.config import OPTIONAL_ENV_VARS
         assert OPTIONAL_ENV_VARS["TAVILY_API_KEY"]["url"] == "https://app.tavily.com/home"
+
+    def test_searxng_base_url_has_no_vendor_url(self):
+        """SEARXNG_BASE_URL is self-hosted, so no vendor URL is expected."""
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        assert OPTIONAL_ENV_VARS["SEARXNG_BASE_URL"]["url"] is None
 
     def test_tavily_in_env_vars_by_version(self):
         """TAVILY_API_KEY is listed in ENV_VARS_BY_VERSION."""
@@ -392,6 +412,14 @@ class TestOptionalEnvVarsRegistry:
         for vars_list in ENV_VARS_BY_VERSION.values():
             all_vars.extend(vars_list)
         assert "TAVILY_API_KEY" in all_vars
+
+    def test_searxng_in_env_vars_by_version(self):
+        """SEARXNG_BASE_URL is listed in ENV_VARS_BY_VERSION."""
+        from hermes_cli.config import ENV_VARS_BY_VERSION
+        all_vars = []
+        for vars_list in ENV_VARS_BY_VERSION.values():
+            all_vars.extend(vars_list)
+        assert "SEARXNG_BASE_URL" in all_vars
 
 
 class TestAnthropicTokenMigration:
@@ -459,7 +487,7 @@ class TestCustomProviderCompatibility:
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw["_config_version"] == 21
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert raw["providers"]["openai-direct"] == {
             "api": "https://api.openai.com/v1",
             "api_key": "test-key",
@@ -606,7 +634,7 @@ class TestInterimAssistantMessageConfig:
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw["_config_version"] == 21
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert raw["display"]["tool_progress"] == "off"
         assert raw["display"]["interim_assistant_messages"] is True
 
@@ -626,7 +654,7 @@ class TestDiscordChannelPromptsConfig:
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw["_config_version"] == 21
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert raw["discord"]["auto_thread"] is True
         assert raw["discord"]["channel_prompts"] == {}
 

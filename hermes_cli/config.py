@@ -845,6 +845,7 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
     10: ["TAVILY_API_KEY"],
     11: ["TERMINAL_MODAL_MODE"],
+    19: ["SEARXNG_BASE_URL"],
 }
 
 # Required environment variables with metadata for migration prompts.
@@ -1260,6 +1261,14 @@ OPTIONAL_ENV_VARS = {
         "url": "https://app.tavily.com/home",
         "tools": ["web_search", "web_extract", "web_crawl"],
         "password": True,
+        "category": "tool",
+    },
+    "SEARXNG_BASE_URL": {
+        "description": "Base URL for a self-hosted SearXNG instance used for web search (e.g. http://127.0.0.1:18080)",
+        "prompt": "SearXNG base URL",
+        "url": None,
+        "tools": ["web_search"],
+        "password": False,
         "category": "tool",
     },
     "BROWSERBASE_API_KEY": {
@@ -1885,7 +1894,7 @@ def _normalize_custom_provider_entry(
     from urllib.parse import urlparse
 
     base_url = ""
-    for url_key in ("base_url", "url", "api"):
+    for url_key in ("api", "url", "base_url"):
         raw_url = entry.get(url_key)
         if isinstance(raw_url, str) and raw_url.strip():
             candidate = raw_url.strip()

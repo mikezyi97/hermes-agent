@@ -5,13 +5,24 @@ from hermes_cli.status import show_status
 
 def test_show_status_includes_tavily_key(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TAVILY_API_KEY", "tvly-1234567890abcdef")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-1...cdef")
 
     show_status(SimpleNamespace(all=False, deep=False))
 
     output = capsys.readouterr().out
     assert "Tavily" in output
     assert "tvly...cdef" in output
+
+
+def test_show_status_includes_searxng_base_url(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SEARXNG_BASE_URL", "http://127.0.0.1:18080")
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "SearXNG" in output
+    assert "http...8080" in output
 
 
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):

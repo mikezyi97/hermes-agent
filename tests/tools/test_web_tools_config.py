@@ -259,6 +259,7 @@ class TestBackendSelection:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "SEARXNG_BASE_URL",
     )
 
     def setup_method(self):
@@ -304,6 +305,12 @@ class TestBackendSelection:
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={"backend": "tavily"}):
             assert _get_backend() == "tavily"
+
+    def test_config_searxng(self):
+        """web.backend=searxng in config → 'searxng'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "searxng"}):
+            assert _get_backend() == "searxng"
 
     def test_config_tavily_overrides_env_keys(self):
         """web.backend=tavily in config → 'tavily' even if Firecrawl key set."""
@@ -353,6 +360,13 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}):
             assert _get_backend() == "tavily"
+
+    def test_fallback_searxng_only_key(self):
+        """Only SEARXNG_BASE_URL set → 'searxng'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch.dict(os.environ, {"SEARXNG_BASE_URL": "http://127.0.0.1:18080"}):
+            assert _get_backend() == "searxng"
 
     def test_fallback_tavily_with_firecrawl_prefers_firecrawl(self):
         """Tavily + Firecrawl keys, no config → 'firecrawl' (backward compat)."""
@@ -489,6 +503,7 @@ class TestCheckWebApiKey:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "SEARXNG_BASE_URL",
     )
 
     def setup_method(self):
@@ -532,6 +547,11 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
+    def test_searxng_base_url_only(self):
+        with patch.dict(os.environ, {"SEARXNG_BASE_URL": "http://127.0.0.1:18080"}):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is True
+
     def test_no_keys_returns_false(self):
         from tools.web_tools import check_web_api_key
         assert check_web_api_key() is False
@@ -571,6 +591,92 @@ class TestCheckWebApiKey:
                 with patch.dict(os.environ, {"FIRECRAWL_GATEWAY_URL": "http://127.0.0.1:3002"}, clear=False):
                     from tools.web_tools import check_web_api_key
                     assert check_web_api_key() is True
+
+    def test_extract_capability_disabled_for_configured_searxng_backend(self):
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "searxng"}):
+            with patch.dict(os.environ, {"SEARXNG_BASE_URL": "http://127.0.0.1:18080"}, clear=False):
+                from tools.web_tools import check_web_extract_api_key
+                assert check_web_extract_api_key() is False
+
+
+class TestSearxngBackend:
+    def setup_method(self):
+        os.environ.pop("SEARXNG_BASE_URL", None)
+
+    def teardown_method(self):
+        os.environ.pop("SEARXNG_BASE_URL", None)
+
+    def test_web_search_uses_searxng_json_api(self):
+        import tools.web_tools
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "results": [
+                {
+                    "title": "Hermes Agent",
+                    "url": "https://example.com/hermes",
+                    "content": "Project home",
+                }
+            ]
+        }
+
+        with patch("tools.web_tools._get_backend", return_value="searxng"), \
+             patch.dict(os.environ, {"SEARXNG_BASE_URL": "http://127.0.0.1:18080"}), \
+             patch("tools.web_tools.httpx.get", return_value=response) as mock_get, \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch.object(tools.web_tools._debug, "log_call"), \
+             patch.object(tools.web_tools._debug, "save"):
+            result = json.loads(tools.web_tools.web_search_tool("Hermes Agent", limit=3))
+
+        mock_get.assert_called_once()
+        assert mock_get.call_args.kwargs["params"] == {
+            "q": "Hermes Agent",
+            "format": "json",
+            "language": "all",
+            "safesearch": 0,
+        }
+        assert result["success"] is True
+        assert result["data"]["web"][0]["title"] == "Hermes Agent"
+        assert result["data"]["web"][0]["position"] == 1
+
+    def test_searxng_base_url_must_be_local_origin(self):
+        from tools.web_tools import _get_searxng_base_url
+
+        with patch.dict(os.environ, {"SEARXNG_BASE_URL": "https://example.com/searxng"}):
+            with pytest.raises(ValueError, match="bare origin|local self-hosted instance"):
+                _get_searxng_base_url()
+
+    @pytest.mark.asyncio
+    async def test_web_crawl_returns_clear_error_for_searxng(self):
+        import tools.web_tools
+
+        with patch("tools.web_tools._get_backend", return_value="searxng"):
+            result = json.loads(
+                await tools.web_tools.web_crawl_tool(
+                    "https://example.com",
+                    instructions="Find docs",
+                    use_llm_processing=False,
+                )
+            )
+
+        assert result["success"] is False
+        assert "SearXNG" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_web_extract_returns_clear_error_for_searxng(self):
+        import tools.web_tools
+
+        with patch("tools.web_tools._get_backend", return_value="searxng"):
+            result = json.loads(
+                await tools.web_tools.web_extract_tool(
+                    ["https://example.com"],
+                    use_llm_processing=False,
+                )
+            )
+
+        assert result["success"] is False
+        assert "SearXNG" in result["error"]
 
 
 def test_web_requires_env_includes_exa_key():

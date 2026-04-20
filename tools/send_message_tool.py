@@ -359,6 +359,12 @@ def _describe_media_for_mirror(media_files):
 
 def _get_cron_auto_delivery_target():
     """Return the cron scheduler's auto-delivery target for the current run, if any."""
+    from gateway.session_context import get_session_env
+
+    session_key = get_session_env("HERMES_SESSION_KEY", "")
+    if not str(session_key).startswith("cron_"):
+        return None
+
     platform = os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
     chat_id = os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
     if not platform or not chat_id:

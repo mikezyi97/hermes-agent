@@ -1980,22 +1980,36 @@ async def send_weixin_direct(
     token_store.restore(account_id)
     context_token = token_store.get(account_id, chat_id)
 
-    live_adapter = _LIVE_ADAPTERS.get(resolved_token)
-    send_session = getattr(live_adapter, '_send_session', None)
-    if live_adapter is not None and send_session is not None and not send_session.closed:
+    def _live_send_session_matches_current_loop(session: Any) -> bool:
+        """Return True only when a live aiohttp session is safe to reuse.
+
+        Cron/tool sends run through ``model_tools._run_async()``, which can execute on
+        a different event loop than the gateway's long-poll adapter. Reusing an
+        ``aiohttp.ClientSession`` across loops triggers runtime errors such as:
+        ``Timeout context manager should be used inside a task``.
+        """
+        if session is None or getattr(session, "closed", False):
+            return False
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        session_loop = getattr(session, "_loop", None) or getattr(session, "loop", None)
+        return session_loop is current_loop
+
+    async def _send_via_live_adapter(adapter: Any) -> Dict[str, Any]:
         last_result: Optional[SendResult] = None
-        cleaned = live_adapter.format_message(message)
-        if cleaned:
-            last_result = await live_adapter.send(chat_id, cleaned)
+        if message and message.strip():
+            last_result = await adapter.send(chat_id, message)
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await live_adapter.send_image_file(chat_id, media_path)
+                last_result = await adapter.send_image_file(chat_id, media_path)
             else:
-                last_result = await live_adapter.send_document(chat_id, media_path)
+                last_result = await adapter.send_document(chat_id, media_path)
             if not last_result.success:
                 return {"error": f"Weixin media send failed: {last_result.error}"}
 
@@ -2006,6 +2020,17 @@ async def send_weixin_direct(
             "message_id": last_result.message_id if last_result else None,
             "context_token_used": bool(context_token),
         }
+
+    live_adapter = _LIVE_ADAPTERS.get(resolved_token)
+    send_session = getattr(live_adapter, '_send_session', None)
+    if live_adapter is not None:
+        if _live_send_session_matches_current_loop(send_session):
+            return await _send_via_live_adapter(live_adapter)
+
+        session_loop = getattr(send_session, "_loop", None) or getattr(send_session, "loop", None)
+        if session_loop is not None and getattr(session_loop, "is_running", lambda: False)():
+            concurrent_future = asyncio.run_coroutine_threadsafe(_send_via_live_adapter(live_adapter), session_loop)
+            return await asyncio.wrap_future(concurrent_future)
 
     async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
         adapter = WeixinAdapter(
@@ -2029,9 +2054,8 @@ async def send_weixin_direct(
         adapter._token_store = token_store
 
         last_result: Optional[SendResult] = None
-        cleaned = adapter.format_message(message)
-        if cleaned:
-            last_result = await adapter.send(chat_id, cleaned)
+        if message and message.strip():
+            last_result = await adapter.send(chat_id, message)
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 

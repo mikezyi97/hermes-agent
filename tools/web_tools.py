@@ -45,6 +45,7 @@ import logging
 import os
 import re
 import asyncio
+from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 import httpx
 from firecrawl import Firecrawl
@@ -88,7 +89,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -99,6 +100,7 @@ def _get_backend() -> str:
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("searxng", _is_backend_available("searxng")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -117,7 +119,71 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "searxng":
+        try:
+            _get_searxng_base_url()
+            return True
+        except ValueError:
+            return False
     return False
+
+
+def _get_searxng_base_url() -> str:
+    """Return configured SearXNG base URL or raise a helpful error."""
+    base_url = os.getenv("SEARXNG_BASE_URL", "").strip().rstrip("/")
+    if not base_url:
+        raise ValueError(
+            "SEARXNG_BASE_URL environment variable not set. "
+            "Set it to your SearXNG instance, e.g. http://127.0.0.1:18080"
+        )
+
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("SEARXNG_BASE_URL must start with http:// or https://")
+    if not parsed.hostname:
+        raise ValueError("SEARXNG_BASE_URL must include a hostname")
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("SEARXNG_BASE_URL must be a bare origin without path, query, or fragment")
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError(
+            "SEARXNG_BASE_URL must point to a local self-hosted instance for Hermes MVP "
+            "(allowed: 127.0.0.1, localhost, ::1)"
+        )
+
+    return base_url
+
+
+def _searxng_search(query: str, limit: int) -> dict:
+    """Query the SearXNG JSON search API and normalize the response."""
+    response = httpx.get(
+        f"{_get_searxng_base_url()}/search",
+        params={
+            "q": query,
+            "format": "json",
+            "language": "all",
+            "safesearch": 0,
+        },
+        timeout=30,
+        follow_redirects=False,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    web_results = []
+    for index, result in enumerate(payload.get("results", [])[: max(limit, 0)]):
+        if not isinstance(result, dict):
+            continue
+        url = result.get("url") or result.get("link") or ""
+        title = result.get("title") or url
+        description = result.get("content") or result.get("snippet") or ""
+        web_results.append(
+            {
+                "title": title,
+                "url": url,
+                "description": description,
+                "position": index + 1,
+            }
+        )
+    return {"success": True, "data": {"web": web_results}}
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
@@ -189,6 +255,7 @@ def _web_requires_env() -> list[str]:
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
+        "SEARXNG_BASE_URL",
     ]
     if managed_nous_tools_enabled():
         requires.extend(
@@ -1118,6 +1185,16 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.save()
             return result_json
 
+        if backend == "searxng":
+            logger.info("SearXNG search: '%s' (limit: %d)", query, limit)
+            response_data = _searxng_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
         response = _get_firecrawl_client().search(
@@ -1223,6 +1300,14 @@ async def web_extract_tool(
     try:
         logger.info("Extracting content from %d URL(s)", len(urls))
 
+        backend = _get_backend()
+        if backend == "searxng":
+            return tool_error(
+                "SearXNG backend currently supports web_search only in Hermes. "
+                "Use another web backend or browser/web_extract for page content.",
+                success=False,
+            )
+
         # ── SSRF protection — filter out private/internal URLs before any backend ──
         safe_urls = []
         ssrf_blocked: List[Dict[str, Any]] = []
@@ -1239,8 +1324,6 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            backend = _get_backend()
-
             if backend == "parallel":
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
@@ -1544,6 +1627,13 @@ async def web_crawl_tool(
         backend = _get_backend()
 
         # Tavily supports crawl via its /crawl endpoint
+        if backend == "searxng":
+            return tool_error(
+                "SearXNG backend currently supports web_search only in Hermes. "
+                "Use another web backend for crawl operations.",
+                success=False,
+            )
+
         if backend == "tavily":
             # Ensure URL has protocol
             if not url.startswith(('http://', 'https://')):
@@ -1919,12 +2009,28 @@ def check_firecrawl_api_key() -> bool:
     return _has_direct_firecrawl_config() or _is_tool_gateway_ready()
 
 
-def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available."""
+def check_web_search_api_key() -> bool:
+    """Check whether the configured web-search backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "searxng"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng"))
+
+
+def check_web_extract_api_key() -> bool:
+    """Check whether the configured extract-capable backend is available."""
+    configured = _load_web_config().get("backend", "").lower().strip()
+    extract_backends = ("exa", "parallel", "firecrawl", "tavily")
+    if configured == "searxng":
+        return False
+    if configured in extract_backends:
+        return _is_backend_available(configured)
+    return any(_is_backend_available(backend) for backend in extract_backends)
+
+
+def check_web_api_key() -> bool:
+    """Backward-compatible alias for search backend availability."""
+    return check_web_search_api_key()
 
 
 def check_auxiliary_model() -> bool:
@@ -2082,7 +2188,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=5),
-    check_fn=check_web_api_key,
+    check_fn=check_web_search_api_key,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -2093,7 +2199,7 @@ registry.register(
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_api_key,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",

@@ -758,3 +758,92 @@ class TestWeixinVoiceSending:
         assert voice_item["encode_type"] == 6
         assert voice_item["sample_rate"] == 24000
         assert voice_item["bits_per_sample"] == 16
+
+
+class TestWeixinDirectSendLoopSafety:
+    def test_send_weixin_direct_uses_live_adapter_loop_when_session_loop_mismatches(
+        self,
+        monkeypatch,
+    ):
+        class _ForeignLoop:
+            def is_running(self):
+                return True
+
+        class _ForeignLoopSession:
+            closed = False
+            _loop = _ForeignLoop()
+
+        class _LiveAdapter:
+            def __init__(self):
+                self._send_session = _ForeignLoopSession()
+                self.send = AsyncMock(return_value=SendResult(success=True, message_id="live-msg"))
+                self.send_image_file = AsyncMock(return_value=SendResult(success=True, message_id="live-img"))
+                self.send_document = AsyncMock(return_value=SendResult(success=True, message_id="live-doc"))
+
+        live_adapter = _LiveAdapter()
+        monkeypatch.setitem(weixin._LIVE_ADAPTERS, "tok", live_adapter)
+
+        scheduled = {}
+
+        def _fake_run_coroutine_threadsafe(coro, loop):
+            import threading
+
+            scheduled["loop"] = loop
+            holder = {}
+
+            def _runner():
+                worker_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(worker_loop)
+                try:
+                    holder["result"] = worker_loop.run_until_complete(coro)
+                finally:
+                    worker_loop.close()
+                    asyncio.set_event_loop(None)
+
+            thread = threading.Thread(target=_runner)
+            thread.start()
+            thread.join()
+            scheduled["result"] = holder["result"]
+
+            class _DoneFuture:
+                def result(self, timeout=None):
+                    return scheduled["result"]
+
+            return _DoneFuture()
+
+        async def _fake_wrap_future(fut):
+            return fut.result()
+
+        client_session_used = {"value": False}
+
+        class _ClientSessionCM:
+            def __init__(self, *args, **kwargs):
+                client_session_used["value"] = True
+
+            async def __aenter__(self):
+                raise AssertionError("fresh ClientSession fallback should not be used")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        monkeypatch.setattr(weixin.asyncio, "run_coroutine_threadsafe", _fake_run_coroutine_threadsafe)
+        monkeypatch.setattr(weixin.asyncio, "wrap_future", _fake_wrap_future)
+        monkeypatch.setattr(weixin.aiohttp, "ClientSession", _ClientSessionCM)
+
+        try:
+            result = asyncio.run(
+                weixin.send_weixin_direct(
+                    extra={"account_id": "acct", "base_url": "https://example.com", "cdn_base_url": "https://cdn.example.com"},
+                    token="tok",
+                    chat_id="wxid_test123",
+                    message="# Title",
+                    media_files=None,
+                )
+            )
+        finally:
+            weixin._LIVE_ADAPTERS.pop("tok", None)
+
+        assert result["success"] is True
+        assert scheduled["loop"] is live_adapter._send_session._loop
+        live_adapter.send.assert_awaited_once()
+        assert client_session_used["value"] is False

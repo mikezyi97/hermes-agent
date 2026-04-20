@@ -19,6 +19,15 @@ from tools.tool_backend_helpers import (
 )
 
 
+def _has_valid_searxng_base_url() -> bool:
+    """Return True when SEARXNG_BASE_URL passes Hermes' MVP validation."""
+    try:
+        from tools.web_tools import _get_searxng_base_url
+        return bool(_get_searxng_base_url())
+    except Exception:
+        return False
+
+
 _DEFAULT_PLATFORM_TOOLSETS = {
     "cli": "hermes-cli",
 }
@@ -271,6 +280,7 @@ def get_nous_subscription_features(
     direct_firecrawl = bool(get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL"))
     direct_parallel = bool(get_env_value("PARALLEL_API_KEY"))
     direct_tavily = bool(get_env_value("TAVILY_API_KEY"))
+    direct_searxng = _has_valid_searxng_base_url()
     direct_fal = bool(get_env_value("FAL_KEY"))
     direct_openai_tts = bool(resolve_openai_audio_api_key())
     direct_elevenlabs = bool(get_env_value("ELEVENLABS_API_KEY"))
@@ -314,10 +324,11 @@ def get_nous_subscription_features(
             or (web_backend == "firecrawl" and direct_firecrawl)
             or (web_backend == "parallel" and direct_parallel)
             or (web_backend == "tavily" and direct_tavily)
+            or (web_backend == "searxng" and direct_searxng)
         )
     )
     web_available = bool(
-        managed_web_available or direct_exa or direct_firecrawl or direct_parallel or direct_tavily
+        managed_web_available or direct_exa or direct_firecrawl or direct_parallel or direct_tavily or direct_searxng
     )
 
     image_managed = image_tool_enabled and managed_image_available and not direct_fal

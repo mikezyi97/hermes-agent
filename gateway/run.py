@@ -872,6 +872,21 @@ class GatewayRunner:
 
     # -----------------------------------------------------------------
 
+    async def _safe_adapter_disconnect(self, adapter, platform) -> None:
+        """Call adapter.disconnect() defensively, swallowing any error.
+
+        Used when adapter.connect() failed or raised — the adapter may
+        be partially initialized and not present in self.adapters yet.
+        """
+        try:
+            await adapter.disconnect()
+        except Exception as e:
+            try:
+                platform_name = getattr(platform, "value", None) or str(platform)
+            except Exception:
+                platform_name = str(platform)
+            logger.debug("✗ %s disconnect cleanup error: %s", platform_name, e)
+
     def _flush_memories_for_session(
         self,
         old_session_id: str,
@@ -2084,6 +2099,9 @@ class GatewayRunner:
                                 "next_retry": time.monotonic() + 30,
                             }
                     else:
+                        # Close any partially initialized resources so failed
+                        # startup attempts do not leak aiohttp/httpx sessions.
+                        await self._safe_adapter_disconnect(adapter, platform)
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying",

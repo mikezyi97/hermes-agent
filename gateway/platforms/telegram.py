@@ -812,7 +812,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 # previous webhook registration and silently stop receiving updates.
                 delete_webhook = getattr(self._bot, "delete_webhook", None)
                 if callable(delete_webhook):
-                    await delete_webhook(drop_pending_updates=False)
+                    try:
+                        await delete_webhook(drop_pending_updates=False)
+                    except Exception as e:
+                        logger.warning("[%s] delete_webhook failed during polling bootstrap; continuing: %s", self.name, e)
 
                 loop = asyncio.get_running_loop()
 

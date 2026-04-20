@@ -350,6 +350,31 @@ def test_local_browser_provider_is_saved_explicitly(monkeypatch):
     assert config["browser"]["cloud_provider"] == "local"
 
 
+def test_web_tool_category_includes_searxng_provider():
+    provider = next(
+        (
+            provider
+            for provider in TOOL_CATEGORIES["web"]["providers"]
+            if provider.get("web_backend") == "searxng"
+        ),
+        None,
+    )
+
+    assert provider is not None
+    assert provider["name"] == "SearXNG Self-Hosted"
+    assert provider["tag"] == "Search only — private metasearch over your own local SearXNG instance"
+    assert provider["env_vars"] == [
+        {"key": "SEARXNG_BASE_URL", "prompt": "Your SearXNG base URL (e.g., http://127.0.0.1:18080)"}
+    ]
+
+
+def test_configured_backend_must_validate_searxng_origin(monkeypatch):
+    monkeypatch.setenv("SEARXNG_BASE_URL", "https://example.com")
+    from tools.web_tools import check_web_api_key
+    with patch("tools.web_tools._load_web_config", return_value={"backend": "searxng"}):
+        assert check_web_api_key() is False
+
+
 def test_first_install_nous_auto_configures_managed_defaults(monkeypatch):
     monkeypatch.setattr("hermes_cli.tools_config.managed_nous_tools_enabled", lambda: True)
     monkeypatch.setattr("hermes_cli.nous_subscription.managed_nous_tools_enabled", lambda: True)
