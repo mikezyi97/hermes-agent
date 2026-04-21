@@ -259,6 +259,17 @@ class TestWeixinStatePersistence:
         assert json.loads(token_path.read_text(encoding="utf-8")) == {"user-a": "old-token"}
         warning_mock.assert_called_once()
 
+    def test_context_token_delete_persists_removal(self, tmp_path):
+        store = ContextTokenStore(str(tmp_path))
+        store.set("acct", "user-a", "token-a")
+        store.delete("acct", "user-a")
+
+        reloaded = ContextTokenStore(str(tmp_path))
+        reloaded.restore("acct")
+        assert reloaded.get("acct", "user-a") is None
+        token_path = tmp_path / "weixin" / "accounts" / "acct.context-tokens.json"
+        assert json.loads(token_path.read_text(encoding="utf-8")) == {}
+
     def test_save_sync_buf_preserves_existing_file_on_replace_failure(self, tmp_path, monkeypatch):
         sync_path = tmp_path / "weixin" / "accounts" / "acct.sync.json"
         sync_path.parent.mkdir(parents=True, exist_ok=True)
@@ -847,3 +858,120 @@ class TestWeixinDirectSendLoopSafety:
         assert scheduled["loop"] is live_adapter._send_session._loop
         live_adapter.send.assert_awaited_once()
         assert client_session_used["value"] is False
+
+    def test_send_weixin_direct_primes_getconfig_before_fresh_session_send(self, monkeypatch, tmp_path):
+        store = ContextTokenStore(str(tmp_path))
+        store.set("acct", "wxid_test123", "ctx-1")
+
+        class _ClientSessionCM:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        get_config_mock = AsyncMock(return_value={"typing_ticket": "ticket-1"})
+        send_mock = AsyncMock(return_value=SendResult(success=True, message_id="fresh-msg"))
+
+        monkeypatch.setattr(weixin, "get_hermes_home", lambda: Path(tmp_path))
+        monkeypatch.setattr(weixin, "_get_config", get_config_mock)
+        monkeypatch.setattr(weixin.aiohttp, "ClientSession", lambda *args, **kwargs: _ClientSessionCM())
+        monkeypatch.setattr(weixin.WeixinAdapter, "send", send_mock)
+
+        result = asyncio.run(
+            weixin.send_weixin_direct(
+                extra={"account_id": "acct", "base_url": "https://example.com", "cdn_base_url": "https://cdn.example.com"},
+                token="tok",
+                chat_id="wxid_test123",
+                message="hello",
+                media_files=None,
+            )
+        )
+
+        assert result["success"] is True
+        assert get_config_mock.await_count == 1
+        assert get_config_mock.await_args.kwargs["context_token"] == "ctx-1"
+        send_mock.assert_awaited_once()
+
+    def test_send_weixin_direct_uses_latest_persisted_account_when_env_account_is_stale(self, monkeypatch, tmp_path):
+        weixin.save_weixin_account(
+            str(tmp_path),
+            account_id="acct-live",
+            token="live-token",
+            base_url="https://live.example.com",
+            user_id="wxid_test123",
+        )
+        store = ContextTokenStore(str(tmp_path))
+        store.set("acct-live", "wxid_test123", "ctx-live")
+
+        class _ClientSessionCM:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        get_config_mock = AsyncMock(return_value={"typing_ticket": "ticket-live"})
+        send_mock = AsyncMock(return_value=SendResult(success=True, message_id="fresh-msg"))
+
+        monkeypatch.setattr(weixin, "get_hermes_home", lambda: Path(tmp_path))
+        monkeypatch.setattr(weixin, "_get_config", get_config_mock)
+        monkeypatch.setattr(weixin.aiohttp, "ClientSession", lambda *args, **kwargs: _ClientSessionCM())
+        monkeypatch.setattr(weixin.WeixinAdapter, "send", send_mock)
+
+        result = asyncio.run(
+            weixin.send_weixin_direct(
+                extra={"account_id": "acct-stale", "base_url": "https://stale.example.com", "cdn_base_url": "https://cdn.example.com"},
+                token="stale-token",
+                chat_id="wxid_test123",
+                message="hello",
+                media_files=None,
+            )
+        )
+
+        assert result["success"] is True
+        assert get_config_mock.await_args.kwargs["base_url"] == "https://live.example.com"
+        assert get_config_mock.await_args.kwargs["token"] == "live-token"
+        assert get_config_mock.await_args.kwargs["context_token"] == "ctx-live"
+        send_mock.assert_awaited_once()
+
+    def test_send_weixin_direct_clears_persisted_context_token_when_getconfig_expires(self, monkeypatch, tmp_path):
+        store = ContextTokenStore(str(tmp_path))
+        store.set("acct", "wxid_test123", "ctx-expired")
+
+        class _ClientSessionCM:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        get_config_mock = AsyncMock(side_effect=[
+            {"errcode": weixin.SESSION_EXPIRED_ERRCODE},
+            {"typing_ticket": "ticket-2"},
+        ])
+        send_mock = AsyncMock(return_value=SendResult(success=True, message_id="fresh-msg"))
+
+        monkeypatch.setattr(weixin, "get_hermes_home", lambda: Path(tmp_path))
+        monkeypatch.setattr(weixin, "_get_config", get_config_mock)
+        monkeypatch.setattr(weixin.aiohttp, "ClientSession", lambda *args, **kwargs: _ClientSessionCM())
+        monkeypatch.setattr(weixin.WeixinAdapter, "send", send_mock)
+
+        result = asyncio.run(
+            weixin.send_weixin_direct(
+                extra={"account_id": "acct", "base_url": "https://example.com", "cdn_base_url": "https://cdn.example.com"},
+                token="tok",
+                chat_id="wxid_test123",
+                message="hello",
+                media_files=None,
+            )
+        )
+
+        reloaded = ContextTokenStore(str(tmp_path))
+        reloaded.restore("acct")
+
+        assert result["success"] is True
+        assert get_config_mock.await_count == 2
+        assert get_config_mock.await_args_list[0].kwargs["context_token"] == "ctx-expired"
+        assert get_config_mock.await_args_list[1].kwargs["context_token"] is None
+        assert reloaded.get("acct", "wxid_test123") is None

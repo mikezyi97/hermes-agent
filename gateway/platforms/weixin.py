@@ -249,6 +249,39 @@ def load_weixin_account(hermes_home: str, account_id: str) -> Optional[Dict[str,
         return None
 
 
+def load_latest_weixin_account(hermes_home: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Return the newest persisted Weixin account record, if any.
+
+    One-shot tool runs can inherit stale shell env vars even after the active
+    iLink account rotated. The persisted account files under
+    ``~/.hermes/weixin/accounts`` reflect the gateway's actual connected account,
+    so use them as the fallback source of truth when the requested account no
+    longer exists on disk.
+    """
+    newest: Optional[Tuple[float, str, Dict[str, Any]]] = None
+    for path in _account_dir(hermes_home).glob("*.json"):
+        name = path.name
+        if name.endswith(".sync.json") or name.endswith(".context-tokens.json"):
+            continue
+        account_id = path.stem
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        stamp = data.get("saved_at")
+        sort_key = path.stat().st_mtime
+        if isinstance(stamp, str) and stamp:
+            try:
+                sort_key = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+        if newest is None or sort_key > newest[0]:
+            newest = (sort_key, account_id, data)
+    if newest is None:
+        return None
+    return newest[1], newest[2]
+
+
 class ContextTokenStore:
     """Disk-backed ``context_token`` cache keyed by account + peer."""
 
@@ -284,6 +317,10 @@ class ContextTokenStore:
 
     def set(self, account_id: str, user_id: str, token: str) -> None:
         self._cache[self._key(account_id, user_id)] = token
+        self._persist(account_id)
+
+    def delete(self, account_id: str, user_id: str) -> None:
+        self._cache.pop(self._key(account_id, user_id), None)
         self._persist(account_id)
 
     def _persist(self, account_id: str) -> None:
@@ -1523,9 +1560,7 @@ class WeixinAdapter(BasePlatformAdapter):
                         if is_session_expired and not retried_without_token and context_token:
                             retried_without_token = True
                             context_token = None
-                            self._token_store._cache.pop(
-                                self._token_store._key(self._account_id, chat_id), None
-                            )
+                            self._token_store.delete(self._account_id, chat_id)
                             logger.warning(
                                 "[%s] session expired for %s; retrying without context_token",
                                 self.name, _safe_id(chat_id),
@@ -1971,12 +2006,31 @@ async def send_weixin_direct(
     base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
     cdn_base_url = str(extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")
     resolved_token = str(token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
+
+    hermes_home = str(get_hermes_home())
+    persisted = load_weixin_account(hermes_home, account_id) if account_id else None
+    if persisted is None:
+        latest = load_latest_weixin_account(hermes_home)
+        if latest is not None:
+            latest_account_id, latest_data = latest
+            if account_id and account_id != latest_account_id:
+                logger.info(
+                    "weixin direct send: account %s not found on disk; using latest persisted account %s",
+                    _safe_id(account_id),
+                    _safe_id(latest_account_id),
+                )
+            account_id = latest_account_id
+            persisted = latest_data
+    if persisted:
+        account_id = account_id or str(persisted.get("account_id") or "").strip()
+        resolved_token = str(persisted.get("token") or resolved_token).strip()
+        base_url = str(persisted.get("base_url") or base_url).strip().rstrip("/")
     if not resolved_token:
         return {"error": "Weixin token missing. Configure WEIXIN_TOKEN or platforms.weixin.token."}
     if not account_id:
         return {"error": "Weixin account ID missing. Configure WEIXIN_ACCOUNT_ID or platforms.weixin.extra.account_id."}
 
-    token_store = ContextTokenStore(str(get_hermes_home()))
+    token_store = ContextTokenStore(hermes_home)
     token_store.restore(account_id)
     context_token = token_store.get(account_id, chat_id)
 
@@ -1997,7 +2051,55 @@ async def send_weixin_direct(
         session_loop = getattr(session, "_loop", None) or getattr(session, "loop", None)
         return session_loop is current_loop
 
+    async def _prime_adapter_session(adapter: Any) -> None:
+        """Warm direct sends with getconfig so one-shot sends follow the gateway path."""
+        send_session = getattr(adapter, "_send_session", None)
+        if send_session is None or getattr(send_session, "closed", False):
+            return
+
+        token_store = getattr(adapter, "_token_store", None)
+        account_id = getattr(adapter, "_account_id", "")
+        context_token = token_store.get(account_id, chat_id) if token_store and account_id else None
+        retried_without_token = False
+
+        while True:
+            try:
+                response = await _get_config(
+                    send_session,
+                    base_url=getattr(adapter, "_base_url"),
+                    token=getattr(adapter, "_token"),
+                    user_id=chat_id,
+                    context_token=context_token,
+                )
+            except Exception as exc:
+                logger.debug("weixin direct getConfig failed for %s: %s", _safe_id(chat_id), exc)
+                return
+
+            ret = response.get("ret") if isinstance(response, dict) else None
+            errcode = response.get("errcode") if isinstance(response, dict) else None
+            is_session_expired = (
+                ret == SESSION_EXPIRED_ERRCODE
+                or errcode == SESSION_EXPIRED_ERRCODE
+            )
+            if is_session_expired and not retried_without_token and context_token:
+                retried_without_token = True
+                context_token = None
+                if token_store and account_id:
+                    token_store.delete(account_id, chat_id)
+                logger.warning(
+                    "weixin direct getConfig expired for %s; retrying without context_token",
+                    _safe_id(chat_id),
+                )
+                continue
+
+            typing_ticket = str(response.get("typing_ticket") or "") if isinstance(response, dict) else ""
+            typing_cache = getattr(adapter, "_typing_cache", None)
+            if typing_ticket and typing_cache is not None:
+                typing_cache.set(chat_id, typing_ticket)
+            return
+
     async def _send_via_live_adapter(adapter: Any) -> Dict[str, Any]:
+        await _prime_adapter_session(adapter)
         last_result: Optional[SendResult] = None
         if message and message.strip():
             last_result = await adapter.send(chat_id, message)
@@ -2052,6 +2154,8 @@ async def send_weixin_direct(
         adapter._base_url = base_url
         adapter._cdn_base_url = cdn_base_url
         adapter._token_store = token_store
+
+        await _prime_adapter_session(adapter)
 
         last_result: Optional[SendResult] = None
         if message and message.strip():
