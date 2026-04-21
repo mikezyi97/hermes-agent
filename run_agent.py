@@ -3944,6 +3944,17 @@ class AIAgent:
         except Exception:
             pass
 
+        # 6. Close the optional SQLite session store used for session_search / persistence
+        try:
+            session_db = getattr(self, "_session_db", None)
+            if session_db is not None:
+                close_fn = getattr(session_db, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                self._session_db = None
+        except Exception:
+            pass
+
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
         Recover todo state from conversation history.
