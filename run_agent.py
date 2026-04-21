@@ -37,7 +37,8 @@ import time
 import threading
 from types import SimpleNamespace
 import uuid
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Literal
 from openai import OpenAI
 import fire
 from datetime import datetime
@@ -82,6 +83,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
+from _auth_error_classifier import classify_401
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -749,6 +751,83 @@ def _qwen_portal_headers() -> dict:
         "X-DashScope-UserAgent": _ua,
         "X-DashScope-AuthType": "qwen-oauth",
     }
+
+
+CodexAuthKind = Literal[
+    "refresh_then_retry",
+    "reauth_passthrough",
+    "config_passthrough",
+    "passthrough",
+    "unknown_passthrough",
+]
+
+
+@dataclass(frozen=True)
+class CodexAuthAction:
+    kind: CodexAuthKind
+    skip_pool_recovery: bool
+    verdict_category: str
+    verdict_reason: str
+    user_message: Optional[str]
+
+
+def _decide_codex_auth_action(
+    *,
+    status: int,
+    body: str,
+    error_code: str | None,
+) -> CodexAuthAction:
+    """Pure decision layer for OpenAI Codex 401/403 auth routing."""
+    verdict = classify_401(
+        status=status,
+        body=body,
+        error_code=error_code,
+        token_near_expiry=False,
+    )
+
+    if verdict.category == "refreshable":
+        return CodexAuthAction(
+            kind="refresh_then_retry",
+            skip_pool_recovery=False,
+            verdict_category=verdict.category,
+            verdict_reason=verdict.reason,
+            user_message=None,
+        )
+
+    if verdict.category == "reauth":
+        return CodexAuthAction(
+            kind="reauth_passthrough",
+            skip_pool_recovery=True,
+            verdict_category=verdict.category,
+            verdict_reason=verdict.reason,
+            user_message=verdict.user_message,
+        )
+
+    if verdict.category == "config":
+        return CodexAuthAction(
+            kind="config_passthrough",
+            skip_pool_recovery=True,
+            verdict_category=verdict.category,
+            verdict_reason=verdict.reason,
+            user_message=verdict.user_message,
+        )
+
+    if verdict.category == "non_auth":
+        return CodexAuthAction(
+            kind="passthrough",
+            skip_pool_recovery=(verdict.reason == "pairing_required"),
+            verdict_category=verdict.category,
+            verdict_reason=verdict.reason,
+            user_message=None,
+        )
+
+    return CodexAuthAction(
+        kind="unknown_passthrough",
+        skip_pool_recovery=True,
+        verdict_category=verdict.category,
+        verdict_reason=verdict.reason,
+        user_message=None,
+    )
 
 
 class AIAgent:
@@ -3941,17 +4020,6 @@ class AIAgent:
             if client is not None:
                 self._close_openai_client(client, reason="agent_close", shared=True)
                 self.client = None
-        except Exception:
-            pass
-
-        # 6. Close the optional SQLite session store used for session_search / persistence
-        try:
-            session_db = getattr(self, "_session_db", None)
-            if session_db is not None:
-                close_fn = getattr(session_db, "close", None)
-                if callable(close_fn):
-                    close_fn()
-                self._session_db = None
         except Exception:
             pass
 
@@ -10669,24 +10737,63 @@ class AIAgent:
                         classified.should_rotate_credential, classified.should_fallback,
                     )
 
-                    recovered_with_pool, has_retried_429 = self._recover_with_credential_pool(
-                        status_code=status_code,
-                        has_retried_429=has_retried_429,
-                        classified_reason=classified.reason,
-                        error_context=error_context,
-                    )
+                    codex_auth_action = None
+                    if (
+                        self.api_mode == "codex_responses"
+                        and self.provider == "openai-codex"
+                        and status_code in (401, 403)
+                    ):
+                        _body = getattr(api_error, "body", None)
+                        if isinstance(_body, (dict, list)):
+                            try:
+                                codex_body_text = json.dumps(_body, ensure_ascii=False)
+                            except Exception:
+                                codex_body_text = str(_body)
+                        elif _body is None:
+                            codex_body_text = ""
+                        else:
+                            codex_body_text = str(_body)
+                        codex_auth_action = _decide_codex_auth_action(
+                            status=status_code,
+                            body=codex_body_text,
+                            error_code=str(error_context.get("reason") or "") or None,
+                        )
+                        logger.info(
+                            "Codex auth action: kind=%s category=%s reason=%s status=%s",
+                            codex_auth_action.kind,
+                            codex_auth_action.verdict_category,
+                            codex_auth_action.verdict_reason,
+                            status_code,
+                        )
+
+                    if codex_auth_action is not None and codex_auth_action.skip_pool_recovery:
+                        recovered_with_pool = False
+                    else:
+                        recovered_with_pool, has_retried_429 = self._recover_with_credential_pool(
+                            status_code=status_code,
+                            has_retried_429=has_retried_429,
+                            classified_reason=classified.reason,
+                            error_context=error_context,
+                        )
                     if recovered_with_pool:
                         continue
                     if (
                         self.api_mode == "codex_responses"
                         and self.provider == "openai-codex"
-                        and status_code == 401
+                        and status_code in (401, 403)
                         and not codex_auth_retry_attempted
+                        and codex_auth_action is not None
+                        and codex_auth_action.kind == "refresh_then_retry"
                     ):
                         codex_auth_retry_attempted = True
                         if self._try_refresh_codex_client_credentials(force=True):
-                            self._vprint(f"{self.log_prefix}🔐 Codex auth refreshed after 401. Retrying request...")
+                            self._vprint(f"{self.log_prefix}🔐 Codex auth refreshed after {status_code}. Retrying request...", force=True)
                             continue
+                        self._vprint(f"{self.log_prefix}🔐 Codex token refresh failed after {status_code}; re-auth may be required.", force=True)
+                    elif codex_auth_action is not None and codex_auth_action.kind in {"reauth_passthrough", "config_passthrough"}:
+                        self._vprint(f"{self.log_prefix}🔐 Codex auth not auto-refreshed ({codex_auth_action.verdict_reason}).", force=True)
+                        if codex_auth_action.user_message:
+                            self._vprint(f"{self.log_prefix}   💡 {codex_auth_action.user_message}", force=True)
                     if (
                         self.api_mode == "chat_completions"
                         and self.provider == "nous"
